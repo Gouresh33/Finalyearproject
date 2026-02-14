@@ -1,0 +1,158 @@
+import cv2
+import face_recognition
+import pickle
+import numpy as np
+import time
+import logging
+
+# -------------------------------
+# Load model ONCE (fail fast)
+# -------------------------------
+
+try:
+    with open("face_model.pkl", "rb") as f:
+        MODEL_DATA = pickle.load(f)
+except Exception as e:
+    raise RuntimeError("Failed to load face_model.pkl") from e
+
+METHOD = MODEL_DATA.get("method", "svm")
+
+if METHOD == "svm":
+    CLF = MODEL_DATA["classifier"]
+    LABEL_NAMES = MODEL_DATA["label_names"]
+else:
+    KNOWN_ENCODINGS = MODEL_DATA["encodings"]
+    KNOWN_NAMES = MODEL_DATA["names"]
+
+CONFIDENCE_THRESHOLD = 60
+DISTANCE_THRESHOLD = 0.55
+
+
+# -------------------------------
+# Camera-based verification
+# -------------------------------
+def verify_face_from_camera(timeout=5):
+    """
+    Captures frames from webcam for `timeout` seconds.
+    Returns: (name, verified_flag)
+    """
+
+    cap = None
+
+    # Try common camera indexes
+    for idx in (0, 1, 2):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            logging.info(f"Using camera index {idx}")
+            break
+
+    if cap is None or not cap.isOpened():
+        logging.error("No accessible webcam found")
+        return ("Unknown", 0)
+
+    # Camera warm-up
+    time.sleep(0.3)
+
+    start_time = time.time()
+
+    try:
+        while time.time() - start_time < timeout:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(rgb, model="hog")
+
+            if not locations:
+                continue
+
+            encodings = face_recognition.face_encodings(rgb, locations)
+
+            for encoding in encodings:
+                if METHOD == "svm":
+                    probs = CLF.predict_proba([encoding])[0]
+                    idx = int(np.argmax(probs))
+                    confidence = probs[idx] * 100
+                    prediction = CLF.classes_[idx]
+
+                    if confidence >= CONFIDENCE_THRESHOLD:
+                        return (prediction, 1)
+
+                else:
+                    distances = face_recognition.face_distance(
+                        KNOWN_ENCODINGS, encoding
+                    )
+                    min_dist = float(np.min(distances))
+
+                    if min_dist < DISTANCE_THRESHOLD:
+                        idx = int(np.argmin(distances))
+                        return (KNOWN_NAMES[idx], 1)
+
+        return ("Unknown", 0)
+
+    finally:
+        cap.release()
+
+
+# -------------------------------
+# Image-bytes verification (API)
+# -------------------------------
+def verify_face_from_image_bytes(
+    image_bytes,
+    distance_threshold=DISTANCE_THRESHOLD,
+    confidence_threshold=CONFIDENCE_THRESHOLD,
+):
+    arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        print("[DEBUG] Image decode failed")
+        return ("Unknown", 0)
+
+    print("[DEBUG] Image shape:", img.shape)
+
+    # 🔥 FIX: selfie camera mirror
+    img = cv2.flip(img, 1)
+
+    # 🔥 Stabilize detection on high-res mobile images
+    img = cv2.resize(img, (0, 0), fx=0.75, fy=0.75)
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    locations = face_recognition.face_locations(rgb, model="hog")
+
+    print("[DEBUG] Faces found:", len(locations))
+
+    if not locations:
+        return ("Unknown", 0)
+
+    encodings = face_recognition.face_encodings(rgb, locations)
+    print("[DEBUG] Encodings:", len(encodings))
+
+    for encoding in encodings:
+        if METHOD == "svm":
+            probs = CLF.predict_proba([encoding])[0]
+            idx = int(np.argmax(probs))
+            confidence = probs[idx] * 100
+            prediction = CLF.classes_[idx]
+
+            print("[DEBUG] Prediction:", prediction)
+            print("[DEBUG] Confidence:", confidence)
+
+            if confidence >= confidence_threshold:
+                return (prediction, 1)
+
+        else:
+            distances = face_recognition.face_distance(
+                KNOWN_ENCODINGS, encoding
+            )
+            min_dist = float(np.min(distances))
+            idx = int(np.argmin(distances))
+
+            print("[DEBUG] Prediction:", KNOWN_NAMES[idx])
+            print("[DEBUG] Distance:", min_dist)
+
+            if min_dist < distance_threshold:
+                return (KNOWN_NAMES[idx], 1)
+
+    return ("Unknown", 0)
